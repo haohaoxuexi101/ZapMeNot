@@ -16,12 +16,14 @@ You should have received a copy of the GNU General Public License
 along with this program.  If not, see <https://www.gnu.org/licenses/>.
 '''
 
-import math
-import numpy as np
-import numbers
-from . import ray, material, source, shield, detector
-
 import importlib
+import math
+import numbers
+
+import numpy as np
+
+from . import detector, material, ray, shield, source
+from .acceleration import BaseAccelerationBackend, get_backend, has_backend
 pyvista_spec = importlib.util.find_spec("pyvista")
 pyvista_found = pyvista_spec is not None
 if pyvista_found:
@@ -60,6 +62,7 @@ class Model:
         self.detector = None
         self.filler_material = None
         self.buildup_factor_material = None
+        self._backend: BaseAccelerationBackend = get_backend(prefer_gpu=True)
         # used to calculate exposure (R/sec) from flux (photon/cm2 sec),
         # photon energy (MeV),
         # and linear energy absorption coeff (cm2/g)
@@ -139,6 +142,31 @@ class Model:
             raise ValueError("Invalid buildup factor material")
         self.buildup_factor_material = new_material
 
+    def set_acceleration_backend(self, name: str | None = None, prefer_gpu: bool = False):
+        """Select a registered acceleration backend by name or capability."""
+
+        if name is not None:
+            try:
+                self._backend = get_backend(name)
+            except (KeyError, RuntimeError) as exc:
+                raise RuntimeError(f"Requested backend '{name}' is not available") from exc
+        else:
+            self._backend = get_backend(prefer_gpu=prefer_gpu)
+
+    def enable_taichi_acceleration(self, enable=True):
+        """Enable or disable Taichi accelerated calculations."""
+
+        if enable:
+            if not has_backend("taichi"):
+                raise RuntimeError("Taichi acceleration is not available")
+            self._backend = get_backend("taichi")
+        else:
+            self._backend = get_backend("numpy")
+
+    def is_taichi_acceleration_enabled(self):
+        """Return ``True`` when Taichi acceleration will be used."""
+        return self._backend.name == "taichi"
+
     def calculate_exposure(self):
         """Calculates the exposure at the detector location.
 
@@ -191,10 +219,16 @@ class Model:
         source_point_weights = self.source._get_source_point_weights()
         crossing_distances = np.zeros((len(source_points),
                                        len(self.shield_list)))
-        total_distance = np.zeros((len(source_points)))
-        for index, nextPoint in enumerate(source_points):
-            vector = ray.FiniteLengthRay(nextPoint, self.detector.location)
-            total_distance[index] = vector._length
+        use_taichi = self._backend.name == "taichi"
+        rays = ray.build_rays(
+            source_points,
+            self.detector.location,
+            use_taichi=use_taichi,
+            backend=self._backend,
+        )
+        total_distance = np.array([vector.length for vector in rays],
+                                   dtype=np.float64)
+        for index, vector in enumerate(rays):
             # check to see if source point and detector are coincident
             if total_distance[index] == 0.0:
                 raise ValueError("detector and source are coincident")
@@ -202,7 +236,7 @@ class Model:
                 crossing_distances[index, index2] = \
                     thisShield._get_crossing_length(vector)
         gaps = total_distance - np.sum(crossing_distances, axis=1)
-        if np.amin(gaps) < 0:
+        if gaps.size and np.amin(gaps) < 0:
             raise ValueError("Looks like shields and/or sources overlap")
 
         results_by_photon_energy = []
@@ -232,33 +266,34 @@ class Model:
                 gap_xsec = self.filler_material.density * \
                     self.filler_material.get_mass_atten_coeff(photon_energy)
                 total_mfp = total_mfp + (gaps * gap_xsec)
-            uncollided_flux_factor = np.exp(-total_mfp)
             if (self.buildup_factor_material is not None):
                 buildup_factor = \
                     self.buildup_factor_material.get_buildup_factor(
                         photon_energy, total_mfp)
             else:
                 buildup_factor = 1.0
-            # Notes for the following code:
-            # uncollided_point_energy_flux - an ARRAY of uncollided energy
-            #    flux for a at the detector from a range of quadrature
-            #    locations and a specific photon energy
-            # total_uncollided_energy_flux - an INTEGRAL of uncollided energy
-            #    flux for a at the detector and a specific photon energy
-            #
-            uncollided_point_energy_flux = photon_yield * \
-                np.asarray(source_point_weights) \
-                * uncollided_flux_factor * photon_energy * \
-                (1/(4*math.pi*np.power(total_distance, 2)))
-            total_uncollided_energy_flux = np.sum(uncollided_point_energy_flux)
+            weights_np = np.ascontiguousarray(source_point_weights, dtype=np.float64)
+            distance_np = np.ascontiguousarray(total_distance, dtype=np.float64)
+            total_mfp_np = np.ascontiguousarray(total_mfp, dtype=np.float64)
+            if np.isscalar(buildup_factor):
+                buildup_array = np.full_like(distance_np, buildup_factor, dtype=np.float64)
+            else:
+                buildup_array = np.ascontiguousarray(buildup_factor, dtype=np.float64)
 
-            uncollided_point_exposure = uncollided_point_energy_flux * \
-                self._conversion_factor * dose_coeff * 1000 * 3600  # mR/hr
-            total_uncollided_exposure = np.sum(uncollided_point_exposure)
-
-            collided_point_exposure = uncollided_point_exposure * \
-                buildup_factor
-            total_collided_exposure = np.sum(collided_point_exposure)
+            (
+                total_uncollided_energy_flux,
+                total_uncollided_exposure,
+                total_collided_exposure,
+            ) = self._backend.accumulate_exposure(
+                weights_np,
+                distance_np,
+                total_mfp_np,
+                photon_energy,
+                photon_yield,
+                self._conversion_factor,
+                dose_coeff,
+                buildup_array,
+            )
 
             results_by_photon_energy.append(
                 [photon_energy, photon_yield, total_uncollided_energy_flux,
