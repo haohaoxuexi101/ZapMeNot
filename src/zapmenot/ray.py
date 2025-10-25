@@ -16,9 +16,12 @@ You should have received a copy of the GNU General Public License
 along with this program.  If not, see <https://www.gnu.org/licenses/>.
 '''
 
-import numpy as np
 import numbers
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
+
+import numpy as np
+
+from .acceleration import BaseAccelerationBackend, get_backend
 
 
 class FiniteLengthRay:
@@ -113,6 +116,59 @@ class FiniteLengthRay:
         self._sign[1] = int((self._invdir[1] < 0))
         self._sign[2] = int((self._invdir[2] < 0))
 
+    @classmethod
+    def from_precomputed(
+        cls,
+        start,
+        end,
+        length,
+        direction,
+        inverse_direction,
+        sign,
+    ):
+        """Construct a :class:`FiniteLengthRay` from pre-computed values."""
+        if not cls._is_validate_vector(start):
+            raise ValueError("Invalid ray start")
+        if not cls._is_validate_vector(end):
+            raise ValueError("Invalid ray end")
+        direction_arr = np.asarray(direction, dtype=float)
+        inverse_direction_arr = np.asarray(inverse_direction, dtype=float)
+        sign_list = list(sign)
+        if direction_arr.shape != (3,) or inverse_direction_arr.shape != (3,):
+            raise ValueError("Ray directions must be length 3")
+        if len(sign_list) != 3:
+            raise ValueError("Ray sign vector must be length 3")
+
+        obj = cls.__new__(cls)
+        obj._start = list(start)
+        obj._end = list(end)
+        obj._origin = np.array(start, dtype=float)
+        obj._length = float(length)
+        obj._dir = direction_arr
+        obj._invdir = inverse_direction_arr
+        obj._sign = [int(sign_list[0]), int(sign_list[1]), int(sign_list[2])]
+        return obj
+
+    @property
+    def length(self):
+        """float: The total length of the ray."""
+        return self._length
+
+    @property
+    def direction(self):
+        """numpy.ndarray: Unit direction vector of the ray."""
+        return self._dir
+
+    @property
+    def inverse_direction(self):
+        """numpy.ndarray: Component-wise inverse of the direction vector."""
+        return self._invdir
+
+    @property
+    def sign(self):
+        """list[int]: Sign flags for the inverse direction vector."""
+        return list(self._sign)
+
     @staticmethod
     def _is_validate_vector(vector):
         # vector should be a list
@@ -125,3 +181,76 @@ class FiniteLengthRay:
         if not all([isinstance(item, numbers.Number) for item in vector]):
             return False
         return True
+
+
+def build_rays(
+    starts: Sequence[Sequence[float]],
+    end: Sequence[float],
+    use_taichi: bool = False,
+    backend: BaseAccelerationBackend | None = None,
+):
+    """Construct a batch of :class:`FiniteLengthRay` objects.
+
+    Parameters
+    ----------
+    starts : sequence of sequence of float
+        Start coordinates for each ray.
+    end : sequence of float
+        Shared end coordinate for the rays.
+    use_taichi : bool, optional
+        When ``True`` and Taichi is available, use the accelerated backend to
+        compute geometry terms.
+
+    Returns
+    -------
+    list of :class:`FiniteLengthRay`
+        Rays corresponding to the provided start points.
+    """
+
+    if not isinstance(end, Sequence) or len(end) != 3:
+        raise ValueError("Invalid ray end")
+
+    if len(starts) == 0:
+        return []
+
+    start_array = np.asarray(starts, dtype=np.float64)
+    if start_array.ndim != 2 or start_array.shape[1] != 3:
+        raise ValueError("Invalid ray start collection")
+
+    if start_array.size == 0:
+        return []
+
+    end_array = np.asarray(end, dtype=np.float64)
+
+    if backend is None:
+        if use_taichi:
+            try:
+                backend = get_backend("taichi")
+            except (KeyError, RuntimeError) as exc:
+                raise RuntimeError("Taichi acceleration was requested but is unavailable") from exc
+        else:
+            backend = get_backend()
+
+    if use_taichi and backend.name != "taichi":
+        # Explicit user request should be honoured.
+        raise RuntimeError("Taichi acceleration was requested but is unavailable")
+
+    lengths, directions, inverse_directions, signs = backend.compute_ray_geometry(
+        np.ascontiguousarray(start_array, dtype=np.float64),
+        np.ascontiguousarray(end_array, dtype=np.float64),
+    )
+
+    end_list = [float(x) for x in end_array.tolist()]
+    rays = []
+    for idx, start in enumerate(start_array):
+        start_list = [float(x) for x in start.tolist()]
+        ray_obj = FiniteLengthRay.from_precomputed(
+            start_list,
+            end_list,
+            lengths[idx],
+            directions[idx],
+            inverse_directions[idx],
+            signs[idx],
+        )
+        rays.append(ray_obj)
+    return rays

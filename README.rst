@@ -26,6 +26,9 @@ Requirements
  - PyVista (optional for graphics)
  - vtk 9.3 or above (optional for graphics)
  - trame 2.5.2 (optional for graphics)
+ - Taichi (optional for accelerated exposure calculations)
+  - See ``docs/taichi_gpu_optimization.md`` and ``docs/point_kernel_parallel_manual.md``
+    for detailed GPU optimisation guidance.
 
 
 Installation:

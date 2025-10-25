@@ -5,8 +5,39 @@ import numpy as np
 import pandas as pd
 
 from zapmenot import model, source, shield, detector, material
+from zapmenot import taichi_accelerator
+from zapmenot.acceleration import list_backends
 
 pytestmark = pytest.mark.basic
+
+
+# =============================================================
+def test_taichi_acceleration_flag():
+    myModel = model.Model()
+    assert myModel.is_taichi_acceleration_enabled() == \
+        taichi_accelerator.is_available()
+    if taichi_accelerator.is_available():
+        myModel.enable_taichi_acceleration(False)
+        assert not myModel.is_taichi_acceleration_enabled()
+        myModel.enable_taichi_acceleration(True)
+        assert myModel.is_taichi_acceleration_enabled()
+    else:
+        with pytest.raises(RuntimeError):
+            myModel.enable_taichi_acceleration(True)
+        assert not myModel.is_taichi_acceleration_enabled()
+
+
+def test_backend_selection_api():
+    myModel = model.Model()
+    # CPU fallback should always exist
+    myModel.set_acceleration_backend(prefer_gpu=False)
+    assert myModel._backend.name in {info.name for info in list_backends(True)}
+    if taichi_accelerator.is_available():
+        myModel.set_acceleration_backend("taichi")
+        assert myModel.is_taichi_acceleration_enabled()
+    else:
+        with pytest.raises(RuntimeError):
+            myModel.set_acceleration_backend("taichi")
 
 
 # =============================================================
